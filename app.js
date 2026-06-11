@@ -59,10 +59,51 @@ function defaultProgress() {
   };
 }
 function loadProgress() {
-  try { const raw = localStorage.getItem(CONFIG.storageKey); if (raw) return Object.assign(defaultProgress(), JSON.parse(raw)); } catch (e) { /* corrupted -> start fresh */ }
+  try {
+    const raw = localStorage.getItem(CONFIG.storageKey);
+    if (raw) {
+      const p = JSON.parse(raw);
+      const d = defaultProgress();
+      const merged = Object.assign(d, p);
+      merged.settings = Object.assign(defaultProgress().settings, p.settings || {});
+      if (typeof merged.questions !== 'object' || merged.questions === null) merged.questions = {};
+      for (const k of ['sessions', 'mocks', 'pendingSync']) if (!Array.isArray(merged[k])) merged[k] = [];
+      return merged;
+    }
+  } catch (e) {
+    // keep the corrupted raw so it is recoverable, then start fresh
+    try { localStorage.setItem(CONFIG.storageKey + '_corrupt', localStorage.getItem(CONFIG.storageKey) || ''); } catch (e2) { }
+  }
   return defaultProgress();
 }
-function save() { try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(S.progress)); } catch (e) { /* storage full/blocked */ } }
+let warnedStorage = false;
+function save() {
+  S.progress.rev = Date.now();
+  try {
+    mergeFromStorage();
+    localStorage.setItem(CONFIG.storageKey, JSON.stringify(S.progress));
+  } catch (e) {
+    if (!warnedStorage) { warnedStorage = true; toast('⚠ Could not save progress — storage is full or blocked', 5000); }
+  }
+}
+/* Another tab (or a restored frozen tab) may have written newer data: merge
+   per-question by recency, union sessions/mocks, before we overwrite. */
+function mergeFromStorage() {
+  let stored;
+  try { stored = JSON.parse(localStorage.getItem(CONFIG.storageKey) || 'null'); } catch (e) { return; }
+  if (!stored || !stored.rev || stored.rev <= (S.lastSeenRev || 0)) { S.lastSeenRev = S.progress.rev; return; }
+  for (const [id, st] of Object.entries(stored.questions || {})) {
+    const mine = S.progress.questions[id];
+    if (!mine || (st.at || 0) > (mine.at || 0)) S.progress.questions[id] = st;
+  }
+  const key = r => JSON.stringify(r);
+  for (const k of ['sessions', 'mocks']) {
+    const seen = new Set((S.progress[k] || []).map(key));
+    for (const r of stored[k] || []) if (!seen.has(key(r))) S.progress[k].push(r);
+  }
+  if (!S.progress.savedMock && stored.savedMock) S.progress.savedMock = stored.savedMock;
+  S.lastSeenRev = S.progress.rev;
+}
 
 /* ===================== crypto / bank loading ===================== */
 async function decryptBank(code, payload) {
@@ -77,10 +118,14 @@ async function decryptBank(code, payload) {
 }
 
 async function fetchBankPayload() {
-  const r = await fetch('bank.enc.json', { cache: 'no-store' });
+  let r;
+  try { r = await fetch('bank.enc.json', { cache: 'no-store' }); }
+  catch (e) { throw Object.assign(new Error('offline'), { network: true }); }
   if (r.ok) return { kind: 'enc', payload: await r.json() };
-  const dev = await fetch('bank.json', { cache: 'no-store' });
-  if (dev.ok) return { kind: 'plain', payload: await dev.json() };
+  if (['localhost', '127.0.0.1'].includes(location.hostname)) {
+    const dev = await fetch('bank.json', { cache: 'no-store' });
+    if (dev.ok) return { kind: 'plain', payload: await dev.json() };
+  }
   throw new Error('Question bank not found');
 }
 
@@ -141,43 +186,96 @@ function buildSyncPayload(kind, detail) {
   };
 }
 async function sendPayload(payload) {
-  const r = await fetch(CONFIG.syncEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) throw new Error('sync http ' + r.status);
+  let r;
+  try {
+    r = await fetch(CONFIG.syncEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true, // survives tab close mid-flight
+    });
+  } catch (e) { throw Object.assign(new Error('network'), { permanent: false }); }
+  if (!r.ok) {
+    const retriable = r.status >= 500 || r.status === 408 || r.status === 429;
+    throw Object.assign(new Error('http ' + r.status), { permanent: !retriable });
+  }
   const j = await r.json().catch(() => ({}));
-  if (j.success === 'false' || j.success === false) throw new Error('sync rejected');
+  if (j.success === 'false' || j.success === false) throw Object.assign(new Error('rejected'), { permanent: true });
+}
+function queuePayload(kind, payload) {
+  payload._kind = kind;
+  if (kind === 'snapshot') S.progress.pendingSync = S.progress.pendingSync.filter(p => p._kind !== 'snapshot');
+  S.progress.pendingSync.push(payload);
+  S.progress.pendingSync = S.progress.pendingSync.slice(-20);
+  save();
 }
 async function syncResults(kind, detail, { silent = false } = {}) {
   if (!CONFIG.syncEndpoint.startsWith('http')) return; // not configured (dev)
   const payload = buildSyncPayload(kind, detail);
+  queuePayload(kind, payload); // queue-first: nothing is lost if the tab closes mid-flight
   try {
     await sendPayload(payload);
+    const i = S.progress.pendingSync.indexOf(payload);
+    if (i !== -1) S.progress.pendingSync.splice(i, 1);
     S.progress.lastSync = Date.now(); save();
     if (!silent) toast('Results sent to Nick ✓');
     flushPending();
   } catch (e) {
-    S.progress.pendingSync.push(payload); save();
-    if (!silent) toast('Offline — results saved, will retry');
+    if (e.permanent) {
+      const i = S.progress.pendingSync.indexOf(payload);
+      if (i !== -1) S.progress.pendingSync.splice(i, 1);
+      save();
+      if (!silent) toast('Could not send results — copy your results code from Settings instead');
+    } else if (!silent) toast('Offline — results saved, will retry');
   }
 }
+let flushing = false;
 async function flushPending() {
-  const pend = S.progress.pendingSync;
-  if (!pend.length) return;
-  const remaining = [];
-  for (const p of pend) {
-    try { await sendPayload(p); S.progress.lastSync = Date.now(); }
-    catch (e) { remaining.push(p); }
-  }
-  S.progress.pendingSync = remaining; save();
+  if (flushing || !S.progress.pendingSync.length) return;
+  flushing = true;
+  try {
+    for (const p of S.progress.pendingSync.slice()) {
+      try {
+        await sendPayload(p);
+        const i = S.progress.pendingSync.indexOf(p);
+        if (i !== -1) S.progress.pendingSync.splice(i, 1);
+        S.progress.lastSync = Date.now(); save();
+      } catch (e) {
+        if (e.permanent) {
+          const i = S.progress.pendingSync.indexOf(p);
+          if (i !== -1) S.progress.pendingSync.splice(i, 1);
+          save();
+        }
+        // retriable: keep it and stop — connectivity is probably down
+        else break;
+      }
+    }
+  } finally { flushing = false; }
 }
 function resultsBlob() {
   return btoa(unescape(encodeURIComponent(JSON.stringify({
     name: S.progress.settings.name, questions: S.progress.questions,
     sessions: S.progress.sessions, mocks: S.progress.mocks, ts: Date.now(),
   }))));
+}
+function restoreFromBlob(text) {
+  const m = String(text).trim().match(/POWERPREP:([A-Za-z0-9+/=]+)/);
+  if (!m) throw new Error('not a results code');
+  const data = JSON.parse(decodeURIComponent(escape(atob(m[1]))));
+  if (typeof data.questions !== 'object') throw new Error('bad payload');
+  let merged = 0;
+  for (const [id, st] of Object.entries(data.questions || {})) {
+    const mine = S.progress.questions[id];
+    if (!mine || (st.at || 0) > (mine.at || 0)) { S.progress.questions[id] = st; merged++; }
+  }
+  const key = r => JSON.stringify(r);
+  for (const k of ['sessions', 'mocks']) {
+    const seen = new Set((S.progress[k] || []).map(key));
+    for (const r of data[k] || []) if (!seen.has(key(r))) S.progress[k].push(r);
+  }
+  if (data.name && !S.progress.settings.name) S.progress.settings.name = data.name;
+  save();
+  return merged;
 }
 
 /* ===================== study session engine ===================== */
@@ -238,6 +336,7 @@ function setGuessed(v) {
 }
 function nextQuestion() {
   const s = S.session;
+  if (!s || s.finishedRec || S.view !== 'quiz') return; // double-click / stale-handler guard
   s.answered = null;
   s.idx++;
   if (s.idx >= s.queue.length) {
@@ -246,19 +345,20 @@ function nextQuestion() {
       s.idx = 0; s.round++;
       toast(`Round ${s.round}: re-asking the ${s.queue.length} you missed`);
     } else {
-      finishSession(); return;
+      finishSession(true); return;
     }
   }
   render();
 }
-function finishSession() {
+function finishSession(completed = false) {
   const s = S.session;
+  if (s.finishedRec) return;
   const secs = Math.round((Date.now() - s.started) / 1000);
   const firstRound = s.results.filter(r => r.round === 1);
   const rec = {
     date: todayISO(), kind: s.kind, unit: s.unit,
     n: firstRound.length, correct: firstRound.filter(r => r.correct).length,
-    cleared: s.missedThisRound.length === 0, secs,
+    cleared: completed && s.missedThisRound.length === 0, secs,
   };
   S.progress.sessions.push(rec);
   S.progress.savedSession = null; save();
@@ -311,7 +411,17 @@ function persistMock() {
 function resumeMock() {
   const sm = S.progress.savedMock;
   if (!sm) return;
+  if (!Array.isArray(sm.qs) || sm.qs.some(id => !S.byId.has(id))) {
+    // question bank was updated since this mock started — it can't resume
+    S.progress.savedMock = null; save();
+    toast('That exam used an older question set — start a fresh mock');
+    setView('home'); return;
+  }
   S.mock = Object.assign({ submitted: false, orders: {} }, sm);
+  if (S.mock.deadline <= Date.now()) {
+    toast('Time expired while you were away — exam submitted');
+    setView('mock'); submitMock(); return;
+  }
   setView('mock');
   startTicker();
 }
@@ -439,6 +549,12 @@ function viewHome() {
   const name = S.progress.settings.name;
   const sync = S.progress.pendingSync.length ? `<span class="sync-chip fail"><span class="dot"></span>${S.progress.pendingSync.length} result(s) waiting to send</span>`
     : S.progress.lastSync ? `<span class="sync-chip ok"><span class="dot"></span>Results synced</span>` : '';
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  const installTip = isIOS && !standalone && !S.progress.settings.installTipDismissed
+    ? `<section class="card install-tip"><b>📲 Add to Home Screen</b>
+       <p class="small muted mt" style="margin-top:6px">Tap the Share button, then “Add to Home Screen.” This keeps your progress safe — Safari can delete website data after 7 days of non-use, but installed apps are protected.</p>
+       <button class="btn ghost" data-act="dismissInstallTip" style="margin-top:8px">Got it</button></section>` : '';
 
   const unitRows = S.units.map(u => {
     const m = unitMastery(u);
@@ -452,6 +568,7 @@ function viewHome() {
   }).join('');
 
   return `${topbar()}
+  ${installTip}
   <section class="card hero">
     <div class="ring-wrap">
       <svg width="120" height="120" viewBox="0 0 120 120" aria-hidden="true">
@@ -520,7 +637,7 @@ function viewQuiz() {
       if (orig === q.correct_answer) cls += ' correct';
       else if (orig === a.sel) cls += ' wrong';
       else cls += ' dim';
-    } else if (a === null && s.pendingSel === orig) cls += ' selected';
+    }
     return `<button class="${cls}" data-choice="${orig}" ${a ? 'disabled' : ''}>
       <span class="key">${dispKeys[i]}</span><span>${esc(q.choices[orig])}</span>
     </button>`;
@@ -592,13 +709,13 @@ function viewMock() {
   const answered = Object.keys(m.answers).length;
   const grid = m.qs.map((id, i) => {
     let cls = 'nav-cell';
-    if (m.answers[id]) cls += ' answered';
-    if (m.flags[id]) cls += ' flagged';
-    if (i === m.idx) cls += ' current';
-    return `<button class="${cls}" data-goto="${i}">${i + 1}</button>`;
+    const states = [];
+    if (m.answers[id]) { cls += ' answered'; states.push('answered'); }
+    if (m.flags[id]) { cls += ' flagged'; states.push('flagged'); }
+    if (i === m.idx) { cls += ' current'; states.push('current'); }
+    return `<button class="${cls}" data-goto="${i}" aria-label="Question ${i + 1}${states.length ? ', ' + states.join(', ') : ''}">${i + 1}</button>`;
   }).join('');
-  return `${topbar({ showNav: false })}
-  <div class="mock-bar">
+  return `<div class="mock-bar mock-bar-top">
     <span class="mock-timer" id="mock-timer">${fmtTime((m.deadline - Date.now()) / 1000)}</span>
     <div class="spacer" style="flex:1"></div>
     <span class="small muted">${answered}/${m.qs.length} answered</span>
@@ -763,6 +880,9 @@ function viewSettings() {
       <button class="btn" data-act="syncNow">Send</button></div>
     <div class="switch-row"><div class="sw-label"><b>Copy results code</b><span>Backup you can paste into a text message</span></div>
       <button class="btn" data-act="copyBlob">Copy</button></div>
+    <div class="switch-row"><div class="sw-label" style="flex:1"><b>Restore from results code</b><span>Paste a code that starts with POWERPREP:</span>
+      <input type="text" id="restore-input" placeholder="POWERPREP:…" style="width:100%;margin-top:8px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:16px;font-family:var(--mono)"></div>
+      <button class="btn" data-act="restoreBlob">Restore</button></div>
     <div class="switch-row"><div class="sw-label"><b>Reset all progress</b><span>Cannot be undone</span></div>
       <button class="btn danger" data-act="resetAll">Reset</button></div>
   </section>
@@ -806,6 +926,9 @@ function render() {
   if (S.view === 'quiz') {
     const cb = $('#guess-cb');
     if (cb) cb.addEventListener('change', e => setGuessed(e.target.checked));
+    // keep keyboard/screen-reader flow intact across the innerHTML re-render
+    const next = $('[data-act="next"]');
+    if (next) next.focus();
   }
 }
 
@@ -817,11 +940,14 @@ async function onUnlockSubmit(e) {
   try {
     const { kind, payload } = await fetchBankPayload();
     const bank = kind === 'enc' ? await decryptBank(code, payload) : payload;
-    localStorage.setItem(CONFIG.codeKey, code.trim());
+    try { localStorage.setItem(CONFIG.codeKey, code.trim()); } catch (e) { /* private mode — still usable this session */ }
     initBank(bank);
     afterUnlock();
   } catch (err) {
-    $('#app').innerHTML = viewUnlock('That code didn’t work — double-check it and try again.');
+    const msg = err && err.network
+      ? 'Couldn’t reach the question bank — check your internet connection and try again.'
+      : 'That code didn’t work — double-check it and try again.';
+    $('#app').innerHTML = viewUnlock(msg);
     $('#unlock-form').addEventListener('submit', onUnlockSubmit);
     $('#code-input').focus();
   }
@@ -843,7 +969,7 @@ document.addEventListener('click', e => {
     if (!m.answers[q.id]) delete m.answers[q.id];
     persistMock(); render(); return;
   }
-  if (t.dataset.goto !== undefined && S.view === 'mock') { S.mock.idx = +t.dataset.goto; persistMock(); render(); return; }
+  if (t.dataset.goto !== undefined && S.view === 'mock') { S.mock.idx = +t.dataset.goto; persistMock(); window.scrollTo({ top: 0 }); render(); return; }
   if (t.dataset.reviewq !== undefined) { setView('mockReviewQ', +t.dataset.reviewq); return; }
   switch (t.dataset.act) {
     case 'home': S.session = null; setView('home'); break;
@@ -885,6 +1011,16 @@ document.addEventListener('click', e => {
     case 'copyBlob':
       navigator.clipboard.writeText('POWERPREP:' + resultsBlob()).then(() => toast('Copied — paste it to Nick'), () => toast('Could not copy'));
       break;
+    case 'restoreBlob': {
+      const v = $('#restore-input').value;
+      if (!v.trim()) { toast('Paste a results code first'); break; }
+      try { const n = restoreFromBlob(v); toast(`Restored — ${n} question record(s) merged`); setView('home'); }
+      catch (e) { toast('That doesn’t look like a valid results code'); }
+      break;
+    }
+    case 'dismissInstallTip':
+      S.progress.settings.installTipDismissed = true; save(); render();
+      break;
     case 'resetAll':
       if (confirm('Really erase ALL progress? This cannot be undone.') && confirm('Last chance — erase everything?')) {
         const name = S.progress.settings.name;
@@ -914,18 +1050,27 @@ document.addEventListener('keydown', e => {
 
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 window.addEventListener('online', flushPending);
+// a frozen/background tab may resume after another tab wrote newer progress
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && S.progress) { mergeFromStorage(); if (['home', 'history'].includes(S.view)) render(); }
+});
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
 
 /* ===================== boot ===================== */
 (async function boot() {
   S.progress = loadProgress();
   applyTheme();
-  const savedCode = localStorage.getItem(CONFIG.codeKey);
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  let savedCode = null;
+  try { savedCode = localStorage.getItem(CONFIG.codeKey); } catch (e) { }
   try {
     const { kind, payload } = await fetchBankPayload();
     if (kind === 'plain') { initBank(payload); afterUnlock(); return; }
     if (savedCode) {
       try { initBank(await decryptBank(savedCode, payload)); afterUnlock(); return; }
-      catch (e) { localStorage.removeItem(CONFIG.codeKey); }
+      catch (e) { try { localStorage.removeItem(CONFIG.codeKey); } catch (e2) { } }
     }
     setView('unlock');
   } catch (e) {
