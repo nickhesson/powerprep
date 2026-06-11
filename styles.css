@@ -16,6 +16,8 @@
   --bad-soft: #fcebeb;
   --warn: #b97a0a;
   --warn-soft: #fdf3df;
+  --purple: #7a45d8;
+  --purple-soft: #f0e9fc;
   --ring: rgba(26, 110, 224, .35);
   --shadow: 0 1px 2px rgba(22, 32, 46, .05), 0 4px 16px rgba(22, 32, 46, .06);
   --shadow-lg: 0 4px 12px rgba(22, 32, 46, .08), 0 12px 40px rgba(22, 32, 46, .12);
@@ -41,6 +43,8 @@
   --bad-soft: #3b1a1a;
   --warn: #e3a93c;
   --warn-soft: #38290e;
+  --purple: #ab84f0;
+  --purple-soft: #2a1f47;
   --ring: rgba(77, 148, 245, .4);
   --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 16px rgba(0, 0, 0, .25);
   --shadow-lg: 0 4px 12px rgba(0, 0, 0, .35), 0 16px 48px rgba(0, 0, 0, .4);
@@ -194,6 +198,7 @@ a { color: var(--accent); }
 .ic.green { background: var(--good-soft); color: var(--good); }
 .ic.red { background: var(--bad-soft); color: var(--bad); }
 .ic.amber { background: var(--warn-soft); color: var(--warn); }
+.ic.purple { background: var(--purple-soft); color: var(--purple); }
 .action-card .ac-body { flex: 1; min-width: 0; }
 .action-card .ac-body b { font-size: 16px; display: block; }
 .action-card .ac-body span { font-size: 13.5px; color: var(--text-2); }
@@ -356,7 +361,7 @@ a { color: var(--accent); }
 .back-row h2 { font-size: 19px; }
 .muted { color: var(--text-2); }
 .small { font-size: 13px; }
-.mt { margin-top: 14px; } .mt-lg { margin-top: 22px; }
+.mt { margin-top: 14px; } .mt-lg { margin-top: 22px; } .mb { margin-bottom: 14px; }
 .center { text-align: center; }
 hr.sep { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 

@@ -11,6 +11,9 @@ const CONFIG = {
   sessionSize: 20,
   masteryStreak: 2,
   maxReviewRounds: 3,
+  smartMinSeen: 30,                  // SMART Quiz needs this many seen questions before it has signal
+  smartIntervalsH: [6, 24, 72, 168], // spaced-repetition due intervals (hours), indexed by streak
+  smartUnitCap: 8,                   // max questions one unit can take in a SMART session
   // Replaced with the activated endpoint by build_app.py:
   syncEndpoint: 'https://formsubmit.co/ajax/1c50ce8374d1ea4751c9fe82de099407',
   syncEmail: 'nickhesson@gmail.com',
@@ -141,7 +144,8 @@ function initBank(bank) {
 }
 
 /* ===================== progress helpers ===================== */
-function qStat(id) { return S.progress.questions[id] || { a: 0, c: 0, s: 0, last: null, at: 0, g: 0 }; }
+/* Merge onto full defaults — records imported from older exports may lack newer fields (e.g. g) */
+function qStat(id) { return Object.assign({ a: 0, c: 0, s: 0, last: null, at: 0, g: 0 }, S.progress.questions[id]); }
 function recordAnswer(id, correct, guessed) {
   const st = S.progress.questions[id] || { a: 0, c: 0, s: 0, last: null, at: 0, g: 0 };
   st.a++; if (correct) { st.c++; st.s++; } else { st.s = 0; }
@@ -307,6 +311,73 @@ function startSession(kind, unit = null) {
   setView('quiz');
 }
 
+/* ===================== SMART Quiz (adaptive engine) ===================== */
+/* Deterministic weighted scoring over the student's own answer history —
+   spaced-repetition dueness × error rate × unit weakness. No network calls. */
+function needScore(id, now) {
+  const st = qStat(id);
+  const q = S.byId.get(id);
+  if (!st.a) {
+    // unseen: solid candidate in a weak unit; easier questions surface first
+    return 0.6 + (5 - (q.difficulty || 3)) * 0.01;
+  }
+  const errRate = (st.a - st.c + 0.5) / (st.a + 1); // Laplace-smoothed miss rate
+  const lastWrong = st.last === 0 ? 0.35 : 0;
+  const guessRate = Math.min(1, (st.g || 0) / st.a) * 0.25;
+  const hours = Math.max(0, now - st.at) / 3600000;
+  const dueH = CONFIG.smartIntervalsH[Math.min(st.s, CONFIG.smartIntervalsH.length - 1)];
+  const due = Math.min(1.5, hours / dueH); // 1 = exactly due for re-test
+  let need = (errRate + lastWrong + guessRate) * (0.5 + 0.5 * due);
+  const mastered = st.a > st.c ? st.s >= CONFIG.masteryStreak : st.c >= 1;
+  if (mastered && hours < dueH) need *= 0.15; // mastered and not yet due — rest it
+  return need;
+}
+function unitWeakness(u) {
+  let a = 0, c = 0;
+  for (const id of u.ids) { const st = qStat(id); a += st.a; c += st.c; }
+  const acc = a ? c / a : 0.5; // no data → neutral
+  const m = unitMastery(u);
+  return 0.65 * (1 - acc) + 0.35 * (1 - (m.total ? m.mastered / m.total : 0));
+}
+function smartFocusUnits(k = 3) {
+  return S.units.map(u => ({ unit: u.unit, w: unitWeakness(u) }))
+    .sort((x, y) => y.w - x.w).slice(0, k).map(x => x.unit);
+}
+function smartReady() { return S.bank.filter(q => isSeen(q.id)).length >= CONFIG.smartMinSeen; }
+function pickSmartIds() {
+  const now = Date.now();
+  const wByUnit = new Map(S.units.map(u => [u.unit, unitWeakness(u)]));
+  const ranked = S.bank.map(q => ({
+    id: q.id, unit: q.unit,
+    // jitter keeps back-to-back sessions from being identical
+    score: needScore(q.id, now) * (0.5 + wByUnit.get(q.unit)) * (0.9 + 0.2 * Math.random()),
+  })).sort((x, y) => y.score - x.score);
+  const ids = [], perUnit = {};
+  for (const r of ranked) {
+    if ((perUnit[r.unit] || 0) >= CONFIG.smartUnitCap) continue;
+    ids.push(r.id); perUnit[r.unit] = (perUnit[r.unit] || 0) + 1;
+    if (ids.length >= CONFIG.sessionSize) break;
+  }
+  return ids;
+}
+function startSmartSession() {
+  if (!smartReady()) {
+    if (confirm(`SMART Quiz unlocks once you've answered ${CONFIG.smartMinSeen}+ questions — it learns from your results. Start a mixed study session instead?`)) startSession('all');
+    return;
+  }
+  const ids = pickSmartIds();
+  if (!ids.length) { toast('Nothing to target — you’re all clear!'); return; }
+  S.session = {
+    kind: 'smart', unit: null,
+    queue: ids, idx: 0, round: 1,
+    missedThisRound: [], results: [],
+    answered: null,
+    started: Date.now(),
+    focus: smartFocusUnits(),
+  };
+  setView('quiz');
+}
+
 function currentQ() { return S.byId.get(S.session.queue[S.session.idx]); }
 
 function choiceOrder(q) {
@@ -332,7 +403,7 @@ function setGuessed(v) {
   const s = S.session; if (!s.answered) return;
   const last = s.results[s.results.length - 1];
   last.guessed = v;
-  const st = qStat(last.id); st.g = Math.max(0, st.g + (v ? 1 : -1)); S.progress.questions[last.id] = st; save();
+  const st = qStat(last.id); st.g = Math.max(0, (st.g || 0) + (v ? 1 : -1)); S.progress.questions[last.id] = st; save();
 }
 function nextQuestion() {
   const s = S.session;
@@ -363,7 +434,7 @@ function finishSession(completed = false) {
   S.progress.sessions.push(rec);
   S.progress.savedSession = null; save();
   const missedIds = [...new Set(s.results.filter(r => !r.correct).map(r => r.id))];
-  const title = `${s.kind === 'review' ? 'Review session' : s.kind === 'unit' ? 'Study ' + s.unit : 'Mixed study'} — ${rec.correct}/${rec.n}`;
+  const title = `${s.kind === 'review' ? 'Review session' : s.kind === 'unit' ? 'Study ' + s.unit : s.kind === 'smart' ? 'SMART Quiz' : 'Mixed study'} — ${rec.correct}/${rec.n}`;
   const lines = [
     `${title} (${fmtTime(secs)})`,
     missedIds.length ? `Missed: ${missedIds.join(', ')}` : 'No misses — cleared the session.',
@@ -494,6 +565,7 @@ const ICONS = {
   chev: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
   flag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" x2="4" y1="22" y2="15"/></svg>',
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+  target: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/></svg>',
 };
 
 function topbar({ showNav = true } = {}) {
@@ -592,6 +664,13 @@ function viewHome() {
   </section>
 
   <div class="section-title">Practice</div>
+  <button class="action-card mb" data-act="smartQuiz">
+    <span class="ic purple">${ICONS.target}</span>
+    <span class="ac-body"><b>SMART Quiz</b><span>${smartReady()
+      ? 'Built from your results — targets ' + esc(smartFocusUnits().join(' · '))
+      : 'Learns your weak spots — adapts after ' + CONFIG.smartMinSeen + ' answered questions'}</span></span>
+    <span class="chev">${ICONS.chev}</span>
+  </button>
   <div class="grid-2">
     <button class="action-card" data-act="review" ${queue.length ? '' : 'disabled'}>
       <span class="ic red">${ICONS.redo}</span>
@@ -650,7 +729,8 @@ function viewQuiz() {
       <label class="guess-toggle"><input type="checkbox" id="guess-cb"> I guessed on this one</label>
     </div>` : '';
 
-  const kindLabel = s.kind === 'review' ? 'Review' : s.kind === 'unit' ? s.unit + ' study' : 'Smart study';
+  const kindLabel = s.kind === 'review' ? 'Review' : s.kind === 'unit' ? s.unit + ' study' : s.kind === 'smart' ? 'SMART Quiz' : 'Mixed study';
+  const focusPill = s.kind === 'smart' && s.focus && s.focus.length ? `<span class="pill">Focus: ${esc(s.focus.join(' · '))}</span>` : '';
   return `${topbar()}
   <div class="quiz-top">
     <button class="icon-btn" data-act="quitQuiz" aria-label="End session">${ICONS.back}</button>
@@ -660,6 +740,7 @@ function viewQuiz() {
   <section class="card">
     <div class="q-tagline">
       <span class="pill">${esc(kindLabel)}</span>
+      ${focusPill}
       ${s.round > 1 ? `<span class="pill review">Round ${s.round} — beat your misses</span>` : ''}
       <span class="pill">${esc(q.unit)}</span>
     </div>
@@ -838,8 +919,9 @@ function viewHistory() {
   const mockRows = mocks.length ? mocks.map(r =>
     `<tr><td>${r.date}</td><td><b class="${r.score >= CONFIG.passMark ? 'score-good' : 'score-bad'}">${r.score}%</b></td><td>${r.correct}/${r.n}</td><td>${fmtTime(r.secs)}</td></tr>`).join('')
     : '<tr><td colspan="4" class="muted">No mock exams yet</td></tr>';
+  const kindNames = { all: 'Mixed study', review: 'Review', smart: 'SMART Quiz' };
   const sesRows = sessions.length ? sessions.map(r =>
-    `<tr><td>${r.date}</td><td>${esc(r.kind === 'unit' ? r.unit : r.kind)}</td><td>${r.correct}/${r.n}</td><td>${r.cleared ? '✓ cleared' : '—'}</td></tr>`).join('')
+    `<tr><td>${r.date}</td><td>${esc(r.kind === 'unit' ? r.unit : (kindNames[r.kind] || r.kind))}</td><td>${r.correct}/${r.n}</td><td>${r.cleared ? '✓ cleared' : '—'}</td></tr>`).join('')
     : '<tr><td colspan="4" class="muted">No sessions yet</td></tr>';
   return `${topbar()}
   <div class="back-row"><button class="icon-btn" data-act="home" aria-label="Back">${ICONS.back}</button><h2>My results</h2></div>
@@ -978,6 +1060,7 @@ document.addEventListener('click', e => {
     case 'unit': setView('unit', t.dataset.unit); break;
     case 'studyUnit': startSession('unit', t.dataset.unit); break;
     case 'smart': startSession('all'); break;
+    case 'smartQuiz': startSmartSession(); break;
     case 'review': startSession('review'); break;
     case 'next': nextQuestion(); break;
     case 'quitQuiz':

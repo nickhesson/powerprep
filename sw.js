@@ -1,7 +1,7 @@
 /* PowerPrep service worker — offline support.
    Shell: network-first (so updates land immediately when online).
    Bank: cache-first (large, versioned by build). */
-const VERSION = '23bb8e16';
+const VERSION = 'b2e9042d';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest'];
 const SHELL_CACHE = 'pp-shell-' + VERSION;
 const BANK_CACHE = 'pp-bank-' + VERSION;
